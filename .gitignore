@@ -1,0 +1,32 @@
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Python cache / virtual env
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Local planning notes
+.claude/
+
+# Runtime data and artifacts
+output/
+*.db
+*.db-shm
+*.db-wal
+
+# Build / tmp logs
+*.log
+tmp/

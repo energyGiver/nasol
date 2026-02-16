@@ -7,6 +7,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from nasol.cast import normalize_cast_mentions, normalize_transcript, normalize_transcript_segments
+from nasol.parsing import transcript_hash
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -124,10 +127,27 @@ class NasolRepository:
                     seasons_json TEXT NOT NULL,
                     response TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS codex_jobs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    status TEXT NOT NULL,
+                    job_kind TEXT NOT NULL DEFAULT 'analysis',
+                    query TEXT NOT NULL,
+                    seasons_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    started_at TEXT,
+                    finished_at TEXT,
+                    result_text TEXT,
+                    error_message TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_codex_jobs_status ON codex_jobs(status);
+                CREATE INDEX IF NOT EXISTS idx_codex_jobs_created_at ON codex_jobs(created_at);
                 """
             )
             self._ensure_video_columns(conn)
             self._ensure_video_indexes(conn)
+            self._ensure_codex_job_columns(conn)
 
     def _ensure_video_columns(self, conn: sqlite3.Connection) -> None:
         required_columns = {
@@ -148,6 +168,55 @@ class NasolRepository:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_videos_episode_in_round ON videos(episode_in_round)"
         )
+
+    def _ensure_codex_job_columns(self, conn: sqlite3.Connection) -> None:
+        existing = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(codex_jobs)").fetchall()
+        }
+        if "job_kind" not in existing:
+            try:
+                conn.execute(
+                    "ALTER TABLE codex_jobs ADD COLUMN job_kind TEXT NOT NULL DEFAULT 'analysis'"
+                )
+            except sqlite3.OperationalError as exc:
+                if "duplicate column name" not in str(exc).lower():
+                    raise
+
+    def _normalize_segments_json(self, raw_segments: Any) -> str:
+        if not raw_segments:
+            return ""
+
+        parsed_segments: list[dict[str, Any]] = []
+        if isinstance(raw_segments, str):
+            try:
+                decoded = json.loads(raw_segments)
+            except json.JSONDecodeError:
+                decoded = []
+            if isinstance(decoded, list):
+                parsed_segments = decoded
+        elif isinstance(raw_segments, list):
+            parsed_segments = raw_segments
+
+        normalized = normalize_transcript_segments(parsed_segments)
+        if not normalized:
+            return ""
+        return json.dumps(normalized, ensure_ascii=False)
+
+    def _normalize_video_payload(
+        self,
+        payload: dict[str, Any],
+        include_segments: bool = False,
+    ) -> dict[str, Any]:
+        normalized = dict(payload)
+        normalized["transcript_text"] = normalize_cast_mentions(
+            str(normalized.get("transcript_text") or "")
+        )
+        if include_segments:
+            normalized["transcript_segments"] = self._normalize_segments_json(
+                normalized.get("transcript_segments")
+            )
+        return normalized
 
     def create_job(self, seasons: list[int], include_fallback: bool, dry_run: bool) -> str:
         job_id = uuid.uuid4().hex
@@ -293,7 +362,11 @@ class NasolRepository:
             )
 
     def update_transcript(self, video_id: str, transcript: dict[str, Any]) -> None:
-        segments = transcript.get("transcript_segments") or []
+        normalized_text, normalized_segments = normalize_transcript(
+            text=transcript.get("transcript_text", ""),
+            segments=transcript.get("transcript_segments") or [],
+        )
+        normalized_hash = transcript_hash(normalized_text) if normalized_text else ""
         with self._connect() as conn:
             conn.execute(
                 """
@@ -313,9 +386,9 @@ class NasolRepository:
                     transcript.get("transcript_status", "error"),
                     transcript.get("language", ""),
                     transcript.get("transcript_type", ""),
-                    transcript.get("transcript_text", ""),
-                    json.dumps(segments, ensure_ascii=False),
-                    transcript.get("transcript_hash", ""),
+                    normalized_text,
+                    json.dumps(normalized_segments, ensure_ascii=False),
+                    normalized_hash,
                     utc_now(),
                     transcript.get("error_message"),
                     utc_now(),
@@ -329,7 +402,9 @@ class NasolRepository:
                 "SELECT * FROM videos WHERE video_id = ?",
                 (video_id,),
             ).fetchone()
-        return dict(row) if row else None
+        if not row:
+            return None
+        return self._normalize_video_payload(dict(row), include_segments=True)
 
     def video_has_transcript(self, video_id: str) -> bool:
         with self._connect() as conn:
@@ -397,7 +472,7 @@ class NasolRepository:
         """
         with self._connect() as conn:
             rows = conn.execute(query, params).fetchall()
-        return [dict(row) for row in rows]
+        return [self._normalize_video_payload(dict(row), include_segments=False) for row in rows]
 
     def delete_videos_not_in_set(self, seasons: list[int], keep_by_season: dict[int, list[str]]) -> int:
         if not seasons:
@@ -608,3 +683,117 @@ class NasolRepository:
             payload["seasons"] = json.loads(payload["seasons_json"])
             results.append(payload)
         return results
+
+    def create_codex_job(self, query: str, seasons: list[int], job_kind: str = "analysis") -> int:
+        normalized_kind = "summary" if job_kind == "summary" else "analysis"
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO codex_jobs (status, job_kind, query, seasons_json, created_at)
+                VALUES ('pending', ?, ?, ?, ?)
+                """,
+                (normalized_kind, query, json.dumps(seasons, ensure_ascii=False), utc_now()),
+            )
+        return int(cursor.lastrowid)
+
+    def list_codex_jobs(
+        self,
+        limit: int = 30,
+        status: str | None = None,
+        job_kind: str | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        if job_kind:
+            clauses.append("job_kind = ?")
+            params.append(job_kind)
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(limit)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT *
+                FROM codex_jobs
+                {where_sql}
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            payload = dict(row)
+            payload["seasons"] = json.loads(payload["seasons_json"])
+            payload["job_kind"] = payload.get("job_kind") or "analysis"
+            results.append(payload)
+        return results
+
+    def get_codex_job(self, job_id: int) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM codex_jobs
+                WHERE id = ?
+                """,
+                (job_id,),
+            ).fetchone()
+        if not row:
+            return None
+        payload = dict(row)
+        payload["seasons"] = json.loads(payload["seasons_json"])
+        payload["job_kind"] = payload.get("job_kind") or "analysis"
+        return payload
+
+    def set_codex_job_running(self, job_id: int) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE codex_jobs
+                SET status = 'running',
+                    started_at = ?
+                WHERE id = ?
+                """,
+                (utc_now(), job_id),
+            )
+
+    def complete_codex_job(self, job_id: int, result_text: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE codex_jobs
+                SET status = 'completed',
+                    finished_at = ?,
+                    result_text = ?,
+                    error_message = NULL
+                WHERE id = ?
+                """,
+                (utc_now(), result_text, job_id),
+            )
+
+    def fail_codex_job(self, job_id: int, error_message: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE codex_jobs
+                SET status = 'failed',
+                    finished_at = ?,
+                    error_message = ?
+                WHERE id = ?
+                """,
+                (utc_now(), error_message, job_id),
+            )
+
+    def delete_codex_job(self, job_id: int) -> bool:
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                DELETE FROM codex_jobs
+                WHERE id = ?
+                """,
+                (job_id,),
+            )
+        return bool(cursor.rowcount)

@@ -11,6 +11,7 @@ from urllib.parse import parse_qs, urlparse
 import yt_dlp
 from youtube_transcript_api import NoTranscriptFound, TranscriptsDisabled, YouTubeTranscriptApi
 
+from nasol.cast import normalize_transcript_segments
 from nasol.parsing import (
     classify_series_type,
     ensure_season_list,
@@ -754,15 +755,15 @@ class NasolCollector:
                 return payload
 
             fetched = chosen.fetch()
-            segments = [
+            raw_segments = [
                 {
                     "start": float(getattr(segment, "start", 0.0)),
                     "duration": float(getattr(segment, "duration", 0.0)),
                     "text": str(getattr(segment, "text", "")).strip(),
                 }
                 for segment in fetched
-                if str(getattr(segment, "text", "")).strip()
             ]
+            segments = normalize_transcript_segments(raw_segments)
             transcript_text = "\n".join(segment["text"] for segment in segments)
             payload.update(
                 {

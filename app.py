@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from datetime import datetime
 from pathlib import Path
+import re
 import subprocess
 import sys
 import time
@@ -112,6 +113,110 @@ def format_job_label(job: dict[str, Any]) -> str:
     started = (job.get("started_at") or "")[:19].replace("T", " ")
     status = job.get("status") or "-"
     return f"{job['job_id'][:8]} | {status} | {started}"
+
+
+def format_season_label(seasons: list[int]) -> str:
+    if not seasons:
+        return "전체"
+    sorted_seasons = sorted(seasons)
+    if len(sorted_seasons) == 1:
+        return f"{sorted_seasons[0]}기"
+    return f"{sorted_seasons[0]}기~{sorted_seasons[-1]}기"
+
+
+def build_summary_query(seasons: list[int]) -> str:
+    label = format_season_label(seasons)
+    return (
+        f"{label} 본편 전체 에피소드 transcript를 chunk 기반으로 요약해줘. "
+        "각 에피소드마다 핵심 줄거리, 핵심 인물, 핵심 장면 링크를 정리해줘."
+    )
+
+
+def parse_summary_result_markdown(result_text: str) -> list[dict[str, Any]]:
+    def _to_int(value: Any) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+
+    sections = re.split(r"(?m)^##\s+EPISODE\|", result_text or "")
+    if len(sections) <= 1:
+        return []
+
+    items: list[dict[str, Any]] = []
+    for raw_section in sections[1:]:
+        section = raw_section.strip()
+        if not section:
+            continue
+        lines = section.splitlines()
+        if not lines:
+            continue
+
+        meta_line = lines[0].strip()
+        body_lines = lines[1:]
+        meta: dict[str, Any] = {}
+        for token in meta_line.split("|"):
+            if "=" not in token:
+                continue
+            key, value = token.split("=", 1)
+            meta[key.strip().lower()] = value.strip()
+
+        payload: dict[str, Any] = {
+            "season": _to_int(meta.get("season")),
+            "round": _to_int(meta.get("round")),
+            "episode": _to_int(meta.get("episode")),
+            "video_id": meta.get("video_id") or "",
+            "title": "",
+            "youtube_url": "",
+            "key_people": "",
+            "one_line": "",
+            "summary": "",
+            "chunk_storyline": [],
+            "key_incidents": [],
+            "highlights": [],
+            "evidence_links": [],
+        }
+        list_keys = {"chunk_storyline", "key_incidents", "highlights", "evidence_links"}
+        current_key: str | None = None
+        for line in body_lines:
+            if line.startswith("- ") and ":" not in line:
+                loose_value = line[2:].strip()
+                if current_key in list_keys and loose_value:
+                    payload[current_key].append(loose_value)
+                continue
+
+            if line.startswith("- ") and ":" in line:
+                key, value = line[2:].split(":", 1)
+                current_key = key.strip().lower()
+                clean_value = value.strip()
+                if current_key in list_keys:
+                    if clean_value:
+                        payload[current_key].append(clean_value)
+                elif current_key in payload:
+                    payload[current_key] = clean_value
+                continue
+
+            if line.startswith("  - "):
+                sub_value = line[4:].strip()
+                if current_key in list_keys and sub_value:
+                    payload[current_key].append(sub_value)
+                continue
+
+            if current_key in {"summary", "one_line"}:
+                if line.strip():
+                    payload[current_key] = (payload[current_key] + " " + line.strip()).strip()
+
+        if not payload["chunk_storyline"] and payload["highlights"]:
+            payload["chunk_storyline"] = list(payload["highlights"])
+
+        if not payload["youtube_url"] and payload["video_id"]:
+            payload["youtube_url"] = f"https://www.youtube.com/watch?v={payload['video_id']}"
+        if payload["season"] <= 0:
+            continue
+        items.append(payload)
+
+    items.sort(key=lambda row: (row["season"], row["round"], row["episode"], row["video_id"]))
+    return items
 
 
 def spawn_background_collection(
@@ -503,8 +608,305 @@ def render_analysis_items(items: list[dict[str, Any]], title: str, key_prefix: s
             )
 
 
+def render_codex_queue_mode(repo: NasolRepository) -> None:
+    left, right = st.columns([1, 2.2], gap="large")
+
+    with left:
+        st.markdown("#### Codex Jobs")
+        jobs = repo.list_codex_jobs(limit=30, job_kind="analysis")
+        if not jobs:
+            st.caption("아직 Codex 분석 요청이 없습니다.")
+        for job in jobs:
+            label = f"#{job['id']} [{job['status']}] {job['query'][:16]}"
+            if st.button(label, key=f"codex_job_{job['id']}", use_container_width=True):
+                st.session_state["selected_codex_job_id"] = job["id"]
+
+    with right:
+        available_seasons = repo.get_available_seasons()
+        selected_seasons = st.multiselect(
+            "분석 대상 기수",
+            options=available_seasons,
+            default=available_seasons[-2:] if len(available_seasons) >= 2 else available_seasons,
+            key="analysis_seasons_codex",
+        )
+        st.caption(
+            "요청을 등록하면 Codex 큐에 저장됩니다. "
+            "Codex가 처리 후 결과를 다시 이 화면에서 확인합니다."
+        )
+
+        prompt = st.chat_input("예: 10~11기 갈등 흐름을 회차별로 정리해줘")
+        if prompt:
+            job_id = repo.create_codex_job(prompt, selected_seasons, job_kind="analysis")
+            st.session_state["selected_codex_job_id"] = job_id
+            st.toast(f"Codex 분석 요청 등록 완료 (#{job_id})")
+            st.rerun()
+
+        jobs = repo.list_codex_jobs(limit=50, job_kind="analysis")
+        if not jobs:
+            return
+
+        selected_job_id = st.session_state.get("selected_codex_job_id")
+        valid_ids = {job["id"] for job in jobs}
+        if selected_job_id is None or int(selected_job_id) not in valid_ids:
+            selected_job_id = jobs[0]["id"]
+            st.session_state["selected_codex_job_id"] = selected_job_id
+
+        selected_job = repo.get_codex_job(int(selected_job_id))
+        if not selected_job:
+            st.warning("선택한 작업을 찾을 수 없습니다.")
+            return
+
+        st.markdown("#### 선택된 작업")
+        st.markdown(
+            f"""
+            <div class="result-card">
+                <div class="result-title">#{selected_job['id']} | {selected_job['status']}</div>
+                <div class="result-meta">
+                    기수: {', '.join(str(s) for s in selected_job['seasons']) or '전체'}<br/>
+                    요청: {selected_job['query']}<br/>
+                    생성: {(selected_job.get('created_at') or '')[:19]}
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        if selected_job["status"] == "completed" and selected_job.get("result_text"):
+            st.markdown("#### Codex 결과")
+            st.markdown(selected_job["result_text"])
+        elif selected_job["status"] == "failed":
+            st.error(selected_job.get("error_message") or "Codex 처리 실패")
+        else:
+            st.info(
+                "아직 처리 전입니다. Codex에게 아래 순서로 요청하세요:\n"
+                f"1) `python3 -m nasol.codex_queue packet --job-id {selected_job['id']} "
+                f"--output-dir /tmp/codex_job_{selected_job['id']}`\n"
+                "2) `/tmp/codex_job_<id>/episodes` 파일을 에피소드별로 읽고 사건/핵심인물/서사를 정리\n"
+                f"3) 결과를 `/tmp/codex_job_{selected_job['id']}_result.md`로 작성\n"
+                f"4) `python3 -m nasol.codex_queue complete --job-id {selected_job['id']} "
+                f"--result-file /tmp/codex_job_{selected_job['id']}_result.md`"
+            )
+
+        auto_refresh = st.checkbox(
+            "Codex 작업 자동 새로고침 (3초)",
+            value=False,
+            key="codex_job_autorefresh",
+        )
+        if auto_refresh and selected_job["status"] in {"pending", "running"}:
+            time.sleep(3)
+            st.rerun()
+
+
+def render_summary_tab(repo: NasolRepository) -> None:
+    st.markdown("### 요약 및 정리")
+    available_seasons = repo.get_available_seasons()
+    if not available_seasons:
+        st.info("요약할 대본 데이터가 없습니다. 먼저 수집 탭에서 대본을 수집해주세요.")
+        return
+
+    left, right = st.columns([1, 2.3], gap="large")
+
+    with left:
+        st.markdown("#### Summary Jobs")
+        jobs = repo.list_codex_jobs(limit=40, job_kind="summary")
+        if not jobs:
+            st.caption("아직 요약 요청이 없습니다.")
+        for job in jobs:
+            label = f"#{job['id']} [{job['status']}] {format_season_label(job['seasons'])}"
+            if st.button(label, key=f"summary_job_{job['id']}", use_container_width=True):
+                st.session_state["selected_summary_job_id"] = job["id"]
+
+    with right:
+        default_seasons = available_seasons[-2:] if len(available_seasons) >= 2 else available_seasons
+        selected_seasons = st.multiselect(
+            "요약 대상 기수",
+            options=available_seasons,
+            default=default_seasons,
+            key="summary_target_seasons",
+        )
+        st.caption(
+            "선택한 기수의 본편 대본 전체를 Codex 협업 큐로 요약합니다. "
+            "결과는 에피소드별 핵심 줄거리 + 링크 형태로 시각화됩니다."
+        )
+
+        if st.button("요약 요청 등록", type="primary", use_container_width=True, key="create_summary_job"):
+            if not selected_seasons:
+                st.error("최소 1개 기수를 선택해주세요.")
+            else:
+                prompt = build_summary_query(selected_seasons)
+                job_id = repo.create_codex_job(prompt, selected_seasons, job_kind="summary")
+                st.session_state["selected_summary_job_id"] = job_id
+                st.toast(f"요약 요청 등록 완료 (#{job_id})")
+                st.rerun()
+
+        jobs = repo.list_codex_jobs(limit=80, job_kind="summary")
+        if not jobs:
+            return
+
+        selected_job_id = st.session_state.get("selected_summary_job_id")
+        valid_ids = {job["id"] for job in jobs}
+        if selected_job_id is None or int(selected_job_id) not in valid_ids:
+            selected_job_id = jobs[0]["id"]
+            st.session_state["selected_summary_job_id"] = selected_job_id
+
+        selected_job = repo.get_codex_job(int(selected_job_id))
+        if not selected_job:
+            st.warning("선택한 요약 작업을 찾을 수 없습니다.")
+            return
+
+        st.markdown("#### 선택된 요약 작업")
+        st.markdown(
+            f"""
+            <div class="result-card">
+                <div class="result-title">#{selected_job['id']} | {selected_job['status']}</div>
+                <div class="result-meta">
+                    작업: 요약(summary)<br/>
+                    기수: {', '.join(str(s) for s in selected_job['seasons']) or '전체'}<br/>
+                    요청: {selected_job['query']}<br/>
+                    생성: {(selected_job.get('created_at') or '')[:19]}
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        delete_col, confirm_col = st.columns([1.1, 2.3], gap="small")
+        with delete_col:
+            delete_clicked = st.button(
+                "선택 Summary Job 삭제",
+                use_container_width=True,
+                key=f"summary_delete_btn_{selected_job['id']}",
+            )
+        with confirm_col:
+            delete_confirm = st.checkbox(
+                "삭제 확인",
+                value=False,
+                key=f"summary_delete_confirm_{selected_job['id']}",
+            )
+        if delete_clicked:
+            if selected_job.get("status") == "running":
+                st.error("실행중 작업은 삭제할 수 없습니다.")
+            elif not delete_confirm:
+                st.warning("삭제 확인 체크 후 다시 눌러주세요.")
+            else:
+                deleted = repo.delete_codex_job(int(selected_job["id"]))
+                if deleted:
+                    st.toast(f"Summary Job #{selected_job['id']} 삭제 완료")
+                    st.session_state["selected_summary_job_id"] = None
+                    st.rerun()
+                else:
+                    st.error("작업 삭제에 실패했습니다.")
+
+        if selected_job["status"] == "completed" and selected_job.get("result_text"):
+            items = parse_summary_result_markdown(selected_job.get("result_text") or "")
+            if not items:
+                st.warning("요약 결과 파싱에 실패했습니다. 아래 원문 결과를 확인해주세요.")
+                st.markdown(selected_job["result_text"])
+            else:
+                st.markdown("#### 에피소드 요약 시각화")
+                season_options = sorted({item["season"] for item in items})
+                selected_filter = st.multiselect(
+                    "기수 필터",
+                    options=season_options,
+                    default=season_options,
+                    key=f"summary_result_filter_{selected_job['id']}",
+                )
+                filtered = [item for item in items if item["season"] in selected_filter]
+                m1, m2 = st.columns(2)
+                m1.metric("요약 에피소드 수", f"{len(filtered):,}")
+                m2.metric("전체 에피소드 수", f"{len(items):,}")
+
+                for item in filtered:
+                    round_label = f"{item['round']}회차" if item["round"] else "회차 미확정"
+                    episode_label = f"{item['episode']}에피소드" if item["episode"] else "에피소드 미확정"
+                    title = item.get("title") or "(제목 없음)"
+                    key_people = item.get("key_people") or "-"
+                    one_line = item.get("one_line") or "-"
+                    summary = item.get("summary") or "-"
+                    chunk_storyline = item.get("chunk_storyline") or []
+                    key_incidents = item.get("key_incidents") or []
+                    highlights = item.get("highlights") or []
+                    evidence_links = item.get("evidence_links") or []
+                    youtube_url = item.get("youtube_url") or ""
+                    st.markdown(
+                        f"""
+                        <div class="result-card">
+                            <div class="result-title">
+                                {item['season']}기 {round_label} / {episode_label}
+                            </div>
+                            <div class="result-meta">
+                                {title}<br/>
+                                핵심 인물: {key_people}<br/>
+                                한 줄 요약: {one_line}
+                            </div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+                    if youtube_url:
+                        st.markdown(f"[유튜브 바로가기]({youtube_url})")
+                    st.markdown(f"**요약**: {summary}")
+                    if chunk_storyline:
+                        st.markdown("**Chunk 흐름 요약**")
+                        for point in chunk_storyline:
+                            st.markdown(f"- {point}")
+                    elif highlights:
+                        st.markdown("**핵심 포인트**")
+                        for point in highlights:
+                            st.markdown(f"- {point}")
+                    if key_incidents:
+                        st.markdown("**핵심 사건**")
+                        for incident in key_incidents:
+                            st.markdown(f"- {incident}")
+                    if evidence_links:
+                        st.markdown("**근거 링크**")
+                        for link in evidence_links:
+                            if link.startswith("http"):
+                                st.markdown(f"- [링크]({link})")
+                            else:
+                                st.markdown(f"- {link}")
+
+                with st.expander("요약 결과 원문 보기"):
+                    st.markdown(selected_job["result_text"])
+        elif selected_job["status"] == "failed":
+            st.error(selected_job.get("error_message") or "요약 처리 실패")
+        else:
+            st.info(
+                "아직 처리 전입니다. Codex에게 아래 순서로 요청하세요:\n"
+                f"1) `python3 -m nasol.codex_queue packet --job-id {selected_job['id']} "
+                f"--output-dir /tmp/codex_summary_job_{selected_job['id']} --max-videos 3000 --chunk-chars 1200`\n"
+                "2) `/tmp/codex_summary_job_<id>/episodes`를 에피소드별로 읽고 chunk별 사건을 먼저 정리\n"
+                "3) chunk 정리를 이어붙여 에피소드 서사(summary)를 작성\n"
+                "4) `result_template.md`의 `EPISODE|...` 형식과 `chunk_storyline/key_incidents/evidence_links`를 반드시 채움\n"
+                "5) 이름 표기는 캐스트 기준(영수/영호/영식/영철/광수/상철/영숙/정숙/순자/영자/옥순/현숙/경수/정희/정수/정식)으로 보정\n"
+                f"6) 결과를 `/tmp/codex_summary_job_{selected_job['id']}_result.md`로 저장\n"
+                f"7) `python3 -m nasol.codex_queue complete --job-id {selected_job['id']} "
+                f"--result-file /tmp/codex_summary_job_{selected_job['id']}_result.md`"
+            )
+
+        auto_refresh = st.checkbox(
+            "요약 작업 자동 새로고침 (3초)",
+            value=False,
+            key="summary_job_autorefresh",
+        )
+        if auto_refresh and selected_job["status"] in {"pending", "running"}:
+            time.sleep(3)
+            st.rerun()
+
+
 def render_analysis_tab(repo: NasolRepository, analyst: NasolAnalyst) -> None:
     st.markdown("### 분석")
+    mode = st.radio(
+        "분석 엔진",
+        options=["빠른 규칙 분석", "Codex 협업 큐"],
+        horizontal=True,
+        key="analysis_engine_mode",
+    )
+
+    if mode == "Codex 협업 큐":
+        render_codex_queue_mode(repo)
+        return
+
     left, right = st.columns([1, 2.2], gap="large")
 
     with left:
@@ -585,12 +987,14 @@ def main() -> None:
         unsafe_allow_html=True,
     )
 
-    tab_collect, tab_raw, tab_analysis = st.tabs(["수집", "Raw Data", "분석"])
+    tab_collect, tab_raw, tab_summary, tab_analysis = st.tabs(["수집", "Raw Data", "요약 및 정리", "분석"])
 
     with tab_collect:
         render_collection_tab(repo, collector)
     with tab_raw:
         render_raw_data_tab(repo)
+    with tab_summary:
+        render_summary_tab(repo)
     with tab_analysis:
         render_analysis_tab(repo, analyst)
 

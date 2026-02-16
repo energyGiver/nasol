@@ -36,7 +36,7 @@ class NasolAnalyst:
     def answer(self, query: str, selected_seasons: list[int] | None = None) -> dict[str, Any]:
         available_seasons = self.repo.get_available_seasons()
         seasons = self._resolve_seasons(query, selected_seasons or [], available_seasons)
-        videos = self.repo.get_videos(seasons=seasons, transcript_only=True)
+        videos = self.repo.get_videos(seasons=seasons, transcript_only=True, main_only=True)
 
         mode = self._detect_mode(query)
         if mode == "villain":
@@ -238,7 +238,7 @@ class NasolAnalyst:
 
         lines = [f"{self._season_label(seasons)} 검색 결과입니다."]
         for item in top_items[:8]:
-            episode_label = f"EP{item['episode']}" if item.get("episode") else "EP?"
+            episode_label = f"{item['episode']}회차" if item.get("episode") else "회차 미확정"
             lines.append(
                 f"- {item['season']}기 {episode_label} | {item['title']} "
                 f"(매칭:{item['reason'].replace('키워드 매칭 점수 ', '')})"
@@ -268,7 +268,7 @@ class NasolAnalyst:
             lines.append(f"\n{season}기")
             for row in grouped[season][:8]:
                 episode = row.get("episode")
-                episode_label = f"EP{episode}" if episode else "EP?"
+                episode_label = f"{episode}회차" if episode else "회차 미확정"
                 lines.append(
                     f"- {episode_label} | {row.get('title')} | {row.get('reason')}"
                 )

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections import defaultdict
+from datetime import date, timedelta
 import random
 import time
 from dataclasses import dataclass
@@ -12,9 +14,12 @@ from youtube_transcript_api import NoTranscriptFound, TranscriptsDisabled, YouTu
 from nasol.parsing import (
     classify_series_type,
     ensure_season_list,
+    is_pure_main_content,
+    is_spinoff_content,
     make_dedupe_key,
-    parse_episode_number,
+    parse_episode_in_round,
     parse_first_season,
+    parse_round_number,
     parse_upload_date,
     transcript_hash,
 )
@@ -33,6 +38,11 @@ class CollectorConfig:
     max_search_results: int = 50
     max_retries: int = 3
     preferred_languages: tuple[str, ...] = ("ko", "ko-KR", "en", "en-US")
+    cluster_gap_days: int = 21
+    season_window_before_days: int = 14
+    season_window_after_days: int = 42
+    season_window_single_after_days: int = 120
+    max_season_window_days: int = 220
 
 
 class NasolCollector:
@@ -67,7 +77,7 @@ class NasolCollector:
 
         try:
             log(f"수집 작업 시작: {selected_seasons[0]}기~{selected_seasons[-1]}기")
-            official_seeds = self._discover_official(selected_seasons, log)
+            official_seeds, playlist_seasons = self._discover_official(selected_seasons, log)
             official_coverage = self._count_by_season(official_seeds)
 
             missing_seasons = [
@@ -88,13 +98,24 @@ class NasolCollector:
             log(f"후보 영상 {total_candidates}개 상세 메타데이터 조회 시작")
 
             enriched = self._enrich_candidates(merged_seeds, selected_seasons, log)
-            deduped = self._dedupe_candidates(enriched)
+            main_only = self._filter_main_only(enriched, playlist_seasons)
+            log(f"본편 필터 적용: {len(enriched)} -> {len(main_only)}")
+
+            season_windows = self._infer_season_windows(main_only, selected_seasons, log)
+            window_filtered = self._filter_by_season_windows(main_only, season_windows, log)
+            structured = self._assign_round_episode(window_filtered)
+            deduped = self._dedupe_candidates(structured)
             ordered = self._sort_candidates(deduped)
             kept_candidates = len(ordered)
             log(f"중복 제거 완료: {len(enriched)} -> {kept_candidates}")
 
             for payload in ordered:
                 self.repo.upsert_video(payload)
+
+            keep_by_season = self._build_keep_by_season(ordered)
+            deleted_count = self.repo.delete_videos_not_in_set(selected_seasons, keep_by_season)
+            if deleted_count > 0:
+                log(f"이전 수집 잔여/오염 데이터 {deleted_count}개 정리")
 
             log(f"Raw 데이터 저장 완료: {kept_candidates}개")
 
@@ -173,8 +194,13 @@ class NasolCollector:
 
         return log
 
-    def _discover_official(self, seasons: list[int], log: LogCallback) -> list[dict[str, Any]]:
+    def _discover_official(
+        self,
+        seasons: list[int],
+        log: LogCallback,
+    ) -> tuple[list[dict[str, Any]], set[int]]:
         seeds: dict[str, dict[str, Any]] = {}
+        playlist_seasons: set[int] = set()
 
         playlist_url = f"https://www.youtube.com/{self.config.official_channel_handle}/playlists"
         playlists = self._extract_entries(playlist_url)
@@ -198,6 +224,7 @@ class NasolCollector:
                 )
                 if seed:
                     seeds[seed["video_id"]] = seed
+                    playlist_seasons.add(season)
 
             log(f"{season}기 플레이리스트 영상 {len(playlist_items)}개 탐색")
             time.sleep(self.config.request_delay_seconds)
@@ -214,6 +241,8 @@ class NasolCollector:
             season = parse_first_season(f"{title} {description}")
             if season not in seasons:
                 continue
+            if season in playlist_seasons:
+                continue
             seed = self._seed_from_entry(
                 entry,
                 source="official_channel",
@@ -229,7 +258,7 @@ class NasolCollector:
             f"공식 채널 후보 수집 완료: 플레이리스트 {matched_playlists}개, "
             f"채널목록 매칭 {matched_from_channel}개"
         )
-        return list(seeds.values())
+        return list(seeds.values()), playlist_seasons
 
     def _discover_fallback(self, seasons: list[int], log: LogCallback) -> list[dict[str, Any]]:
         seeds: dict[str, dict[str, Any]] = {}
@@ -299,7 +328,8 @@ class NasolCollector:
         title = (entry.get("title") or "").strip()
         description = (entry.get("description") or "").strip()
         season = forced_season or parse_first_season(f"{title} {description}")
-        episode = parse_episode_number(title)
+        round_number = parse_round_number(title)
+        episode_in_round = parse_episode_in_round(title)
 
         url = raw_url or f"https://www.youtube.com/watch?v={video_id}"
         if not str(url).startswith("http"):
@@ -311,7 +341,9 @@ class NasolCollector:
             "description": description[:1200],
             "url": url,
             "season": season,
-            "episode": episode,
+            "round_number": round_number,
+            "episode": round_number,
+            "episode_in_round": episode_in_round,
             "source": source,
             "is_official": is_official,
             "source_priority": 3 if is_official else 1,
@@ -345,7 +377,8 @@ class NasolCollector:
                 upload_date = parse_upload_date(info.get("upload_date")) or parse_upload_date(
                     seed.get("upload_date")
                 )
-                episode = seed.get("episode") or parse_episode_number(title)
+                round_number = seed.get("round_number") or parse_round_number(title)
+                episode_in_round = seed.get("episode_in_round") or parse_episode_in_round(title)
 
                 channel_id = info.get("channel_id") or seed.get("channel_id") or ""
                 channel_url = info.get("channel_url") or seed.get("channel_url") or ""
@@ -356,6 +389,9 @@ class NasolCollector:
                     or channel_id == self.config.official_channel_id
                     or self.config.official_channel_handle.lower() in (channel_url or "").lower()
                 )
+                source = seed.get("source", "general_search")
+                if official and source == "general_search":
+                    source = "official_channel"
 
                 payload = {
                     "video_id": seed["video_id"],
@@ -373,15 +409,17 @@ class NasolCollector:
                     "like_count": int(info.get("like_count") or 0),
                     "comment_count": int(info.get("comment_count") or 0),
                     "season": inferred_season,
-                    "episode": episode,
+                    "round_number": round_number,
+                    "episode": round_number,
+                    "episode_in_round": episode_in_round,
                     "series_type": classify_series_type(title, description),
-                    "source": "official_channel" if official else seed.get("source", "general_search"),
+                    "source": source,
                     "is_official": official,
                     "source_priority": 3 if official else 1,
                 }
                 payload["dedupe_key"] = make_dedupe_key(
                     season=payload["season"],
-                    episode=payload.get("episode"),
+                    episode=payload.get("round_number"),
                     upload_date=payload.get("upload_date"),
                     title=payload.get("title", ""),
                 )
@@ -405,20 +443,12 @@ class NasolCollector:
         return None
 
     def _dedupe_candidates(self, videos: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        by_video_id: dict[str, dict[str, Any]] = {video["video_id"]: video for video in videos}
-        by_dedupe_key: dict[str, dict[str, Any]] = {}
-
-        for video in by_video_id.values():
-            key = video["dedupe_key"]
-            current = by_dedupe_key.get(key)
-            if not current:
-                by_dedupe_key[key] = video
-                continue
-
-            if self._is_higher_priority(video, current):
-                by_dedupe_key[key] = video
-
-        return list(by_dedupe_key.values())
+        by_video_id: dict[str, dict[str, Any]] = {}
+        for video in videos:
+            existing = by_video_id.get(video["video_id"])
+            if not existing or self._is_higher_priority(video, existing):
+                by_video_id[video["video_id"]] = video
+        return list(by_video_id.values())
 
     def _is_higher_priority(self, incoming: dict[str, Any], existing: dict[str, Any]) -> bool:
         incoming_key = (
@@ -442,7 +472,8 @@ class NasolCollector:
             videos,
             key=lambda row: (
                 row.get("season") or 999,
-                row.get("episode") if row.get("episode") is not None else 9999,
+                row.get("round_number") if row.get("round_number") is not None else 9999,
+                row.get("episode_in_round") if row.get("episode_in_round") is not None else 9999,
                 row.get("upload_date") or "9999-99-99",
                 row.get("video_id"),
             ),
@@ -453,9 +484,7 @@ class NasolCollector:
         season_text = f"{season}기"
         if season_text not in combined:
             return False
-        if "나는 solo" in combined or "나는솔로" in combined or "나솔" in combined:
-            return True
-        return False
+        return is_pure_main_content(title, description)
 
     def _merge_seed_lists(
         self,
@@ -488,6 +517,201 @@ class NasolCollector:
         if query_video_id:
             return query_video_id[0]
         return None
+
+    def _filter_main_only(
+        self,
+        videos: list[dict[str, Any]],
+        playlist_seasons: set[int],
+    ) -> list[dict[str, Any]]:
+        filtered: list[dict[str, Any]] = []
+        for video in videos:
+            title = video.get("title", "")
+            description = video.get("description", "")
+            season = int(video.get("season") or 0)
+
+            if is_spinoff_content(title, description):
+                continue
+
+            if video.get("source") == "official_playlist" and season in playlist_seasons:
+                filtered.append(video)
+                continue
+
+            if is_pure_main_content(title, description):
+                filtered.append(video)
+        return filtered
+
+    def _infer_season_windows(
+        self,
+        videos: list[dict[str, Any]],
+        seasons: list[int],
+        log: LogCallback,
+    ) -> dict[int, tuple[date, date]]:
+        windows: dict[int, tuple[date, date]] = {}
+        for season in seasons:
+            official_dates = [
+                parsed
+                for parsed in (
+                    self._to_date(video.get("upload_date"))
+                    for video in videos
+                    if video.get("season") == season and video.get("is_official")
+                )
+                if parsed
+            ]
+            candidate_dates = official_dates or [
+                parsed
+                for parsed in (
+                    self._to_date(video.get("upload_date"))
+                    for video in videos
+                    if video.get("season") == season
+                )
+                if parsed
+            ]
+            if not candidate_dates:
+                continue
+
+            clusters = self._cluster_dates(sorted(candidate_dates))
+            if not clusters:
+                continue
+            clusters.sort(key=lambda rows: (-len(rows), rows[0].toordinal()))
+            pivot = clusters[0]
+
+            start = pivot[0] - timedelta(days=self.config.season_window_before_days)
+            after_days = (
+                self.config.season_window_after_days
+                if len(pivot) > 1
+                else self.config.season_window_single_after_days
+            )
+            end = pivot[-1] + timedelta(days=after_days)
+
+            if (end - start).days > self.config.max_season_window_days:
+                end = start + timedelta(days=self.config.max_season_window_days)
+
+            windows[season] = (start, end)
+            log(
+                f"{season}기 기간 추정: {start.isoformat()} ~ {end.isoformat()} "
+                f"(근거 {len(pivot)}개)"
+            )
+        return windows
+
+    def _cluster_dates(self, dates: list[date]) -> list[list[date]]:
+        if not dates:
+            return []
+        clusters: list[list[date]] = [[dates[0]]]
+        for current in dates[1:]:
+            if (current - clusters[-1][-1]).days <= self.config.cluster_gap_days:
+                clusters[-1].append(current)
+            else:
+                clusters.append([current])
+        return clusters
+
+    def _filter_by_season_windows(
+        self,
+        videos: list[dict[str, Any]],
+        windows: dict[int, tuple[date, date]],
+        log: LogCallback,
+    ) -> list[dict[str, Any]]:
+        kept: list[dict[str, Any]] = []
+        dropped_by_season: dict[int, int] = {}
+        for video in videos:
+            season = int(video.get("season") or 0)
+            window = windows.get(season)
+            upload_date = self._to_date(video.get("upload_date"))
+            if not window or not upload_date:
+                kept.append(video)
+                continue
+
+            start, end = window
+            if video.get("source") == "official_playlist":
+                kept.append(video)
+                continue
+            if start <= upload_date <= end:
+                kept.append(video)
+                continue
+
+            dropped_by_season[season] = dropped_by_season.get(season, 0) + 1
+
+        if dropped_by_season:
+            log(f"기간 필터로 제외된 영상: {dropped_by_season}")
+        return kept
+
+    def _assign_round_episode(self, videos: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        by_season: dict[int, list[dict[str, Any]]] = defaultdict(list)
+        for video in videos:
+            season = int(video.get("season") or 0)
+            if season <= 0:
+                continue
+            by_season[season].append(video)
+
+        output: list[dict[str, Any]] = []
+        for season, items in by_season.items():
+            items.sort(key=self._video_sort_tuple)
+
+            week_order: dict[tuple[int, int], int] = {}
+            next_round = 1
+            for item in items:
+                if item.get("round_number"):
+                    continue
+                upload_date = self._to_date(item.get("upload_date"))
+                if not upload_date:
+                    continue
+                week_key = (upload_date.isocalendar().year, upload_date.isocalendar().week)
+                if week_key not in week_order:
+                    week_order[week_key] = next_round
+                    next_round += 1
+                item["round_number"] = week_order[week_key]
+
+            grouped_round: dict[int, list[dict[str, Any]]] = defaultdict(list)
+            for item in items:
+                round_number = int(item.get("round_number") or 0)
+                grouped_round[round_number].append(item)
+
+            for _, round_items in grouped_round.items():
+                round_items.sort(key=self._video_sort_tuple)
+                used_numbers: set[int] = set()
+                next_episode = 1
+                for item in round_items:
+                    parsed = item.get("episode_in_round")
+                    if parsed:
+                        parsed_int = int(parsed)
+                        if parsed_int not in used_numbers:
+                            used_numbers.add(parsed_int)
+                            item["episode_in_round"] = parsed_int
+                            continue
+                    while next_episode in used_numbers:
+                        next_episode += 1
+                    item["episode_in_round"] = next_episode
+                    used_numbers.add(next_episode)
+                    next_episode += 1
+
+                for item in round_items:
+                    # Backward compatibility: keep episode as round number.
+                    item["episode"] = item.get("round_number")
+
+            output.extend(items)
+        return output
+
+    def _video_sort_tuple(self, row: dict[str, Any]) -> tuple[Any, ...]:
+        return (
+            row.get("upload_date") or "9999-99-99",
+            int(row.get("published_ts") or 0),
+            row.get("title") or "",
+            row.get("video_id") or "",
+        )
+
+    def _to_date(self, value: str | None) -> date | None:
+        normalized = parse_upload_date(value)
+        if not normalized:
+            return None
+        return date.fromisoformat(normalized)
+
+    def _build_keep_by_season(self, videos: list[dict[str, Any]]) -> dict[int, list[str]]:
+        keep: dict[int, list[str]] = defaultdict(list)
+        for video in videos:
+            season = int(video.get("season") or 0)
+            if season <= 0:
+                continue
+            keep[season].append(video["video_id"])
+        return keep
 
     def _fetch_transcript(self, video_id: str) -> dict[str, Any]:
         payload: dict[str, Any] = {

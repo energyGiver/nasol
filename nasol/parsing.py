@@ -7,16 +7,24 @@ from typing import Iterable
 
 SEASON_PATTERN = re.compile(r"(?<!\d)([1-2]?\d)\s*기")
 
-EPISODE_PATTERNS = [
+ROUND_PATTERNS = [
+    re.compile(r"(?<!\d)(\d{1,3})\s*(?:회|화)\b"),
     re.compile(r"\bEP\s*\.?\s*(\d{1,3})\b", re.IGNORECASE),
     re.compile(r"\bE\s*\.?\s*(\d{1,3})\b", re.IGNORECASE),
-    re.compile(r"(\d{1,3})\s*(?:화|회)\b"),
+]
+
+EPISODE_IN_ROUND_PATTERNS = [
+    re.compile(r"(?:part|클립|장면)\s*(\d{1,3})\b", re.IGNORECASE),
+    re.compile(r"#\s*(\d{1,3})\b"),
 ]
 
 SPINOFF_KEYWORDS = (
     "나솔사계",
     "사랑은 계속된다",
     "지볶행",
+    "지지고 볶고",
+    "나는 solo 그 후",
+    "나는솔로 그 후",
     "솔로민박",
 )
 
@@ -24,6 +32,20 @@ MAIN_KEYWORDS = (
     "나는 solo",
     "나는솔로",
     "솔로나라",
+)
+
+EXCLUDE_KEYWORDS = (
+    "나솔사계",
+    "사랑은 계속된다",
+    "지볶행",
+    "지지고 볶고",
+    "라이브",
+    "live",
+    "비하인드",
+    "근황",
+    "인터뷰",
+    "뉴스",
+    "솔로나라뉴스",
 )
 
 
@@ -45,25 +67,51 @@ def parse_first_season(text: str) -> int | None:
     return seasons[0] if seasons else None
 
 
-def parse_episode_number(text: str) -> int | None:
+def parse_round_number(text: str) -> int | None:
     raw_text = text or ""
-    for pattern in EPISODE_PATTERNS:
+    for pattern in ROUND_PATTERNS:
         match = pattern.search(raw_text)
         if not match:
             continue
-        episode = int(match.group(1))
-        if 1 <= episode <= 999:
-            return episode
+        round_number = int(match.group(1))
+        if 1 <= round_number <= 999:
+            return round_number
+    return None
+
+
+def parse_episode_in_round(text: str) -> int | None:
+    raw_text = text or ""
+    for pattern in EPISODE_IN_ROUND_PATTERNS:
+        match = pattern.search(raw_text)
+        if not match:
+            continue
+        episode_number = int(match.group(1))
+        if 1 <= episode_number <= 999:
+            return episode_number
     return None
 
 
 def classify_series_type(title: str, description: str) -> str:
-    combined = f"{title} {description}".lower()
-    if any(keyword in combined for keyword in SPINOFF_KEYWORDS):
+    if is_spinoff_content(title, description):
         return "spinoff"
+    combined = f"{title} {description}".lower()
     if any(keyword in combined for keyword in MAIN_KEYWORDS):
         return "main"
     return "unknown"
+
+
+def is_spinoff_content(title: str, description: str) -> bool:
+    combined = f"{title} {description}".lower()
+    return any(keyword in combined for keyword in SPINOFF_KEYWORDS)
+
+
+def is_pure_main_content(title: str, description: str) -> bool:
+    combined = f"{title} {description}".lower()
+    if not any(keyword in combined for keyword in MAIN_KEYWORDS):
+        return False
+    if any(keyword in combined for keyword in EXCLUDE_KEYWORDS):
+        return False
+    return True
 
 
 def normalize_title_for_key(title: str) -> str:
@@ -75,12 +123,10 @@ def normalize_title_for_key(title: str) -> str:
 
 def make_dedupe_key(season: int | None, episode: int | None, upload_date: str | None, title: str) -> str:
     season_part = season if season is not None else 0
-    if episode is not None:
-        return f"s{season_part:02d}:e{episode:03d}"
-
     day = upload_date if upload_date else "0000-00-00"
     norm = normalize_title_for_key(title)[:48] or "untitled"
-    return f"s{season_part:02d}:d{day}:{norm}"
+    episode_part = f":e{episode:03d}" if episode is not None else ""
+    return f"s{season_part:02d}{episode_part}:d{day}:{norm}"
 
 
 def normalize_text_for_hash(text: str) -> str:

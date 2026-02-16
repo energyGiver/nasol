@@ -100,13 +100,16 @@ def season_selector(prefix: str) -> list[int]:
     return ensure_season_list(seasons)
 
 
-def format_episode(episode: int | None) -> str:
-    return f"EP{episode}" if episode else "EP?"
+def format_round(round_number: int | None) -> str:
+    return f"{round_number}회차" if round_number else "회차 미확정"
 
 
 def render_collection_tab(repo: NasolRepository, collector: NasolCollector) -> None:
     st.markdown("### 데이터 수집")
-    st.caption("공식 채널(@chonjang) 우선 수집 후, 누락 기수만 일반 검색으로 보완합니다.")
+    st.caption(
+        "공식 채널(@chonjang) 본편 우선 수집 후, 누락 기수만 일반 검색으로 보완합니다. "
+        "지볶행/나솔사계/사랑은 계속된다 등 스핀오프는 제외합니다."
+    )
 
     col_left, col_right = st.columns([2, 1], gap="large")
     with col_left:
@@ -233,7 +236,12 @@ def render_raw_data_tab(repo: NasolRepository) -> None:
     elif transcript_filter == "대본 없음":
         transcript_only = False
 
-    videos = repo.get_videos(seasons=selected_seasons, transcript_only=transcript_only, limit=3000)
+    videos = repo.get_videos(
+        seasons=selected_seasons,
+        transcript_only=transcript_only,
+        main_only=True,
+        limit=3000,
+    )
     if not videos:
         st.warning("조건에 맞는 데이터가 없습니다.")
         return
@@ -257,42 +265,51 @@ def render_raw_data_tab(repo: NasolRepository) -> None:
     m2.metric("대본 성공", f"{transcript_count:,}")
     m3.metric("평균 댓글비율", f"{avg_engagement * 100:.2f}%")
 
-    dashboard_df = pd.DataFrame(videos)[
-        [
-            "season",
-            "episode",
-            "upload_date",
-            "title",
-            "channel_title",
-            "view_count",
-            "comment_count",
-            "source",
-            "transcript_status",
-        ]
-    ].rename(
-        columns={
-            "season": "기수",
-            "episode": "회차",
-            "upload_date": "업로드일",
-            "title": "제목",
-            "channel_title": "채널",
-            "view_count": "조회수",
-            "comment_count": "댓글수",
-            "source": "수집경로",
-            "transcript_status": "대본상태",
-        }
+    table_rows = []
+    for video in videos:
+        table_rows.append(
+            {
+                "기수": video.get("season"),
+                "회차": video.get("round_number") or video.get("episode"),
+                "에피소드": video.get("episode_in_round"),
+                "업로드일": video.get("upload_date"),
+                "제목": video.get("title"),
+                "채널": video.get("channel_title"),
+                "조회수": video.get("view_count"),
+                "댓글수": video.get("comment_count"),
+                "수집경로": video.get("source"),
+                "대본상태": video.get("transcript_status"),
+                "_video_id": video.get("video_id"),
+            }
+        )
+    table_df = pd.DataFrame(table_rows)
+    display_df = table_df.drop(columns=["_video_id"])
+
+    st.caption("행을 클릭하면 바로 아래 Transcript Raw Text가 열립니다.")
+    table_event = st.dataframe(
+        display_df,
+        use_container_width=True,
+        hide_index=True,
+        height=360,
+        on_select="rerun",
+        selection_mode="single-row",
+        key="raw_data_table",
     )
 
-    st.dataframe(dashboard_df, use_container_width=True, hide_index=True, height=320)
+    selected_video_id = st.session_state.get("raw_selected_video_id")
+    selected_rows: list[int] = []
+    try:
+        selected_rows = list(table_event.selection.rows)
+    except Exception:
+        selected_rows = []
+    if selected_rows:
+        selected_video_id = table_df.iloc[selected_rows[0]]["_video_id"]
+        st.session_state["raw_selected_video_id"] = selected_video_id
+    elif not selected_video_id and not table_df.empty:
+        selected_video_id = table_df.iloc[0]["_video_id"]
+        st.session_state["raw_selected_video_id"] = selected_video_id
 
-    option_map = {
-        f"{video.get('season')}기 | {format_episode(video.get('episode'))} | {video.get('title')[:70]}": video[
-            "video_id"
-        ]
-        for video in videos
-    }
-    selected_label = st.selectbox("대본 상세 보기", options=list(option_map.keys()), key="raw_selected_video")
-    selected_video = repo.get_video(option_map[selected_label])
+    selected_video = repo.get_video(selected_video_id) if selected_video_id else None
     if not selected_video:
         return
 
@@ -301,7 +318,8 @@ def render_raw_data_tab(repo: NasolRepository) -> None:
         <div class="result-card">
             <div class="result-title">{selected_video.get('title')}</div>
             <div class="result-meta">
-                {selected_video.get('season')}기 {format_episode(selected_video.get('episode'))} |
+                {selected_video.get('season')}기 {format_round(selected_video.get('round_number') or selected_video.get('episode'))}
+                / {selected_video.get('episode_in_round') or '?'}에피소드 |
                 업로드 {selected_video.get('upload_date')} |
                 조회수 {int(selected_video.get('view_count') or 0):,} |
                 댓글수 {int(selected_video.get('comment_count') or 0):,}
@@ -364,10 +382,11 @@ def render_analysis_items(items: list[dict[str, Any]], title: str, key_prefix: s
     for season in sorted(grouped):
         st.markdown(f"**{season}기**")
         for row in grouped[season]:
+            round_label = format_round(row.get("episode"))
             st.markdown(
                 f"""
                 <div class="result-card">
-                    <div class="result-title">{format_episode(row.get("episode"))} | {row.get("title")}</div>
+                    <div class="result-title">{round_label} | {row.get("title")}</div>
                     <div class="result-meta">
                         점수 {float(row.get("score") or 0):.2f} | {row.get("reason")}<br/>
                         조회수 {int(row.get("view_count") or 0):,} / 댓글수 {int(row.get("comment_count") or 0):,}

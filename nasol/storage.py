@@ -45,7 +45,9 @@ class NasolRepository:
                     like_count INTEGER DEFAULT 0,
                     comment_count INTEGER DEFAULT 0,
                     season INTEGER,
+                    round_number INTEGER,
                     episode INTEGER,
+                    episode_in_round INTEGER,
                     series_type TEXT DEFAULT 'unknown',
                     source TEXT DEFAULT 'official',
                     is_official INTEGER DEFAULT 0,
@@ -124,6 +126,28 @@ class NasolRepository:
                 );
                 """
             )
+            self._ensure_video_columns(conn)
+            self._ensure_video_indexes(conn)
+
+    def _ensure_video_columns(self, conn: sqlite3.Connection) -> None:
+        required_columns = {
+            "round_number": "INTEGER",
+            "episode_in_round": "INTEGER",
+        }
+        existing = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(videos)").fetchall()
+        }
+        for column, column_type in required_columns.items():
+            if column in existing:
+                continue
+            conn.execute(f"ALTER TABLE videos ADD COLUMN {column} {column_type}")
+
+    def _ensure_video_indexes(self, conn: sqlite3.Connection) -> None:
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_videos_round_number ON videos(round_number)")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_videos_episode_in_round ON videos(episode_in_round)"
+        )
 
     def create_job(self, seasons: list[int], include_fallback: bool, dry_run: bool) -> str:
         job_id = uuid.uuid4().hex
@@ -205,7 +229,9 @@ class NasolRepository:
             "like_count": int(video.get("like_count") or 0),
             "comment_count": int(video.get("comment_count") or 0),
             "season": video.get("season"),
+            "round_number": video.get("round_number"),
             "episode": video.get("episode"),
+            "episode_in_round": video.get("episode_in_round"),
             "series_type": video.get("series_type", "unknown"),
             "source": video.get("source", "official"),
             "is_official": 1 if video.get("is_official") else 0,
@@ -221,13 +247,15 @@ class NasolRepository:
                 INSERT INTO videos (
                     video_id, title, url, channel_title, channel_id, channel_url, description,
                     duration_seconds, duration_text, upload_date, published_ts,
-                    view_count, like_count, comment_count, season, episode, series_type,
+                    view_count, like_count, comment_count, season, round_number, episode,
+                    episode_in_round, series_type,
                     source, is_official, source_priority, dedupe_key, discovered_at, updated_at
                 )
                 VALUES (
                     :video_id, :title, :url, :channel_title, :channel_id, :channel_url, :description,
                     :duration_seconds, :duration_text, :upload_date, :published_ts,
-                    :view_count, :like_count, :comment_count, :season, :episode, :series_type,
+                    :view_count, :like_count, :comment_count, :season, :round_number, :episode,
+                    :episode_in_round, :series_type,
                     :source, :is_official, :source_priority, :dedupe_key, :discovered_at, :updated_at
                 )
                 ON CONFLICT(video_id) DO UPDATE SET
@@ -245,7 +273,9 @@ class NasolRepository:
                     like_count = excluded.like_count,
                     comment_count = excluded.comment_count,
                     season = COALESCE(excluded.season, videos.season),
+                    round_number = COALESCE(excluded.round_number, videos.round_number),
                     episode = COALESCE(excluded.episode, videos.episode),
+                    episode_in_round = COALESCE(excluded.episode_in_round, videos.episode_in_round),
                     series_type = excluded.series_type,
                     source = CASE
                         WHEN excluded.source_priority >= videos.source_priority THEN excluded.source
@@ -329,6 +359,7 @@ class NasolRepository:
         self,
         seasons: list[int] | None = None,
         transcript_only: bool | None = None,
+        main_only: bool | None = None,
         limit: int | None = None,
     ) -> list[dict[str, Any]]:
         clauses = []
@@ -344,6 +375,11 @@ class NasolRepository:
         elif transcript_only is False:
             clauses.append("transcript_status != 'success'")
 
+        if main_only is True:
+            clauses.append("series_type = 'main'")
+        elif main_only is False:
+            clauses.append("series_type != 'main'")
+
         where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         limit_sql = f"LIMIT {int(limit)}" if limit else ""
         query = f"""
@@ -352,6 +388,8 @@ class NasolRepository:
             {where_sql}
             ORDER BY
                 COALESCE(season, 999),
+                COALESCE(round_number, 9999),
+                COALESCE(episode_in_round, 9999),
                 COALESCE(episode, 9999),
                 COALESCE(upload_date, '9999-99-99'),
                 video_id
@@ -360,6 +398,35 @@ class NasolRepository:
         with self._connect() as conn:
             rows = conn.execute(query, params).fetchall()
         return [dict(row) for row in rows]
+
+    def delete_videos_not_in_set(self, seasons: list[int], keep_by_season: dict[int, list[str]]) -> int:
+        if not seasons:
+            return 0
+
+        deleted_total = 0
+        with self._connect() as conn:
+            for season in seasons:
+                keep_ids = [video_id for video_id in keep_by_season.get(season, []) if video_id]
+                if keep_ids:
+                    placeholders = ",".join("?" for _ in keep_ids)
+                    cursor = conn.execute(
+                        f"""
+                        DELETE FROM videos
+                        WHERE season = ?
+                          AND video_id NOT IN ({placeholders})
+                        """,
+                        [season, *keep_ids],
+                    )
+                else:
+                    cursor = conn.execute(
+                        """
+                        DELETE FROM videos
+                        WHERE season = ?
+                        """,
+                        (season,),
+                    )
+                deleted_total += int(cursor.rowcount or 0)
+        return deleted_total
 
     def get_season_summary(self, seasons: list[int] | None = None) -> list[dict[str, Any]]:
         clauses = []

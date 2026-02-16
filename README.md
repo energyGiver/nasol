@@ -22,6 +22,7 @@ streamlit run app.py
 
 1. `수집` 탭
 - 단일/범위/다중 기수 선택
+- 백그라운드(멀티프로세스) 수집 지원
 - 수집 진행 로그
 - 완료 토스트 + 기수별 수집 요약
 
@@ -38,6 +39,7 @@ streamlit run app.py
 ## 저장 위치
 
 - DB: `output/nasol.db`
+- 백그라운드 수집 로그: `output/collector_worker.log`
 - 기존 스크립트 결과: `output/` 하위 파일 유지
 
 ## 참고

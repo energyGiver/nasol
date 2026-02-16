@@ -452,16 +452,23 @@ class NasolRepository:
             rows = conn.execute(query, params).fetchall()
         return [dict(row) for row in rows]
 
-    def list_recent_jobs(self, limit: int = 10) -> list[dict[str, Any]]:
+    def list_recent_jobs(self, limit: int = 10, status: str | None = None) -> list[dict[str, Any]]:
+        params: list[Any] = []
+        where_sql = ""
+        if status:
+            where_sql = "WHERE status = ?"
+            params.append(status)
+        params.append(limit)
         with self._connect() as conn:
             rows = conn.execute(
-                """
+                f"""
                 SELECT *
                 FROM jobs
+                {where_sql}
                 ORDER BY started_at DESC
                 LIMIT ?
                 """,
-                (limit,),
+                params,
             ).fetchall()
         return [dict(row) for row in rows]
 

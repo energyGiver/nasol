@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
+from pathlib import Path
+import subprocess
+import sys
+import time
 from typing import Any
 
 import pandas as pd
@@ -104,6 +108,51 @@ def format_round(round_number: int | None) -> str:
     return f"{round_number}회차" if round_number else "회차 미확정"
 
 
+def format_job_label(job: dict[str, Any]) -> str:
+    started = (job.get("started_at") or "")[:19].replace("T", " ")
+    status = job.get("status") or "-"
+    return f"{job['job_id'][:8]} | {status} | {started}"
+
+
+def spawn_background_collection(
+    repo: NasolRepository,
+    seasons: list[int],
+    include_fallback: bool,
+    dry_run: bool,
+    force_refresh: bool,
+) -> int:
+    db_path = str(Path(repo.db_path).resolve())
+    root_dir = str(Path(__file__).parent.resolve())
+    log_dir = Path(root_dir) / "output"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    worker_log_path = log_dir / "collector_worker.log"
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "nasol.background_collect",
+        "--db-path",
+        db_path,
+        "--seasons",
+        ",".join(str(season) for season in seasons),
+        "--include-fallback",
+        "1" if include_fallback else "0",
+        "--dry-run",
+        "1" if dry_run else "0",
+        "--force-refresh",
+        "1" if force_refresh else "0",
+    ]
+    with worker_log_path.open("a", encoding="utf-8") as log_file:
+        process = subprocess.Popen(  # noqa: S603
+            cmd,
+            cwd=root_dir,
+            stdout=log_file,
+            stderr=log_file,
+            start_new_session=True,
+        )
+    return int(process.pid)
+
+
 def render_collection_tab(repo: NasolRepository, collector: NasolCollector) -> None:
     st.markdown("### 데이터 수집")
     st.caption(
@@ -111,19 +160,31 @@ def render_collection_tab(repo: NasolRepository, collector: NasolCollector) -> N
         "지볶행/나솔사계/사랑은 계속된다 등 스핀오프는 제외합니다."
     )
 
+    running_jobs = repo.list_recent_jobs(limit=5, status="running")
+    has_running_job = bool(running_jobs)
+
     col_left, col_right = st.columns([2, 1], gap="large")
     with col_left:
         seasons = season_selector("collect")
         include_fallback = st.checkbox("공식 채널 누락 시 일반 검색 보완", value=True)
         dry_run = st.checkbox("Dry-run (영상 목록만 저장, 대본은 생략)", value=False)
         force_refresh = st.checkbox("기존 대본이 있어도 다시 수집", value=False)
+        run_mode = st.radio(
+            "실행 모드",
+            options=["백그라운드(멀티프로세스)", "포그라운드(단일 프로세스)"],
+            horizontal=True,
+            key="collect_run_mode",
+        )
     with col_right:
+        status_label = "실행중 작업 있음" if has_running_job else "대기중"
+        status_color = "#dc2626" if has_running_job else "#16a34a"
         st.markdown(
-            """
+            f"""
             <div class="title-card">
                 <span class="info-chip">중복 방지</span>
                 <span class="info-chip">시간순 정렬</span>
-                <span class="info-chip">무료 수집</span>
+                <span class="info-chip">무료 수집</span><br/><br/>
+                <b style="color:{status_color};">{status_label}</b>
             </div>
             """,
             unsafe_allow_html=True,
@@ -131,58 +192,86 @@ def render_collection_tab(repo: NasolRepository, collector: NasolCollector) -> N
 
     run_clicked = st.button("수집 시작", use_container_width=True, type="primary")
     log_placeholder = st.empty()
-    summary_placeholder = st.empty()
+    status_placeholder = st.empty()
 
     if run_clicked:
         if not seasons:
             st.error("최소 1개 기수를 선택해주세요.")
-            return
-
-        logs: list[str] = []
-
-        def append_log(message: str) -> None:
-            now = datetime.now().strftime("%H:%M:%S")
-            logs.append(f"[{now}] {message}")
-            log_placeholder.code("\n".join(logs[-120:]), language="text")
-
-        with st.spinner("수집 작업을 실행 중입니다..."):
-            summary = collector.collect(
+        elif has_running_job and run_mode == "백그라운드(멀티프로세스)":
+            st.warning("이미 실행중인 백그라운드 수집 작업이 있습니다. 완료 후 다시 시작해주세요.")
+        elif run_mode == "백그라운드(멀티프로세스)":
+            worker_pid = spawn_background_collection(
+                repo=repo,
                 seasons=seasons,
-                include_fallback_search=include_fallback,
+                include_fallback=include_fallback,
                 dry_run=dry_run,
-                force_transcript_refresh=force_refresh,
-                logger=append_log,
+                force_refresh=force_refresh,
             )
+            st.session_state["last_worker_pid"] = worker_pid
+            st.toast("백그라운드 수집 시작됨. Raw Data 탭으로 이동해 실시간 확인하세요.")
+            status_placeholder.success(f"백그라운드 프로세스 시작 완료 (PID: {worker_pid})")
+        else:
+            logs: list[str] = []
 
-        st.session_state["last_collection_summary"] = summary
-        st.toast("수집 완료: Raw Data 탭에서 결과를 확인하세요.")
+            def append_log(message: str) -> None:
+                now = datetime.now().strftime("%H:%M:%S")
+                logs.append(f"[{now}] {message}")
+                log_placeholder.code("\n".join(logs[-180:]), language="text")
+
+            with st.spinner("수집 작업을 실행 중입니다..."):
+                summary = collector.collect(
+                    seasons=seasons,
+                    include_fallback_search=include_fallback,
+                    dry_run=dry_run,
+                    force_transcript_refresh=force_refresh,
+                    logger=append_log,
+                )
+            st.session_state["last_collection_summary"] = summary
+            st.toast("포그라운드 수집 완료")
 
     summary = st.session_state.get("last_collection_summary")
-    if summary:
-        summary_placeholder.success(
-            (
-                f"완료 | 후보 {summary['total_candidates']}개 "
-                f"-> 저장 {summary['saved_videos']}개 | "
-                f"대본 성공 {summary['transcript_success']}개 / 실패 {summary['transcript_fail']}개"
-            )
+    if summary and not has_running_job:
+        status_placeholder.success(
+            f"최근 실행 결과 | 후보 {summary['total_candidates']}개 -> 저장 {summary['saved_videos']}개"
         )
 
-        if summary["transcript_fail_reasons"]:
-            st.warning(f"대본 실패 사유: {summary['transcript_fail_reasons']}")
+    if has_running_job:
+        running_info = ", ".join(job["job_id"][:8] for job in running_jobs)
+        st.info(f"실행중 수집 작업: {running_info}")
 
-        if summary["season_summary"]:
-            st.dataframe(
-                pd.DataFrame(summary["season_summary"]).rename(
-                    columns={
-                        "season": "기수",
-                        "total_videos": "영상 수",
-                        "transcript_success": "대본 성공",
-                        "avg_engagement": "평균 댓글비율",
-                    }
-                ),
-                use_container_width=True,
-                hide_index=True,
+    st.markdown("### 작업 로그")
+    jobs = repo.list_recent_jobs(limit=20)
+    if jobs:
+        job_map = {job["job_id"]: job for job in jobs}
+        default_job_id = running_jobs[0]["job_id"] if running_jobs else jobs[0]["job_id"]
+        selected_job_id = st.selectbox(
+            "조회할 작업 선택",
+            options=[job["job_id"] for job in jobs],
+            index=[job["job_id"] for job in jobs].index(default_job_id),
+            format_func=lambda job_id: format_job_label(job_map[job_id]),
+            key="collect_log_job_id",
+        )
+        selected_job = job_map[selected_job_id]
+        logs = repo.get_job_logs(selected_job_id, limit=500)
+        if logs:
+            log_text = "\n".join(
+                f"[{row['created_at'][11:19]}] {row['level']}: {row['message']}"
+                for row in logs
             )
+            st.code(log_text, language="text")
+        else:
+            st.caption("아직 기록된 로그가 없습니다.")
+
+        auto_refresh = st.checkbox(
+            "실행중 작업 자동 새로고침 (3초)",
+            value=False,
+            key="collect_log_autorefresh",
+        )
+        if auto_refresh and selected_job.get("status") == "running":
+            time.sleep(3)
+            st.rerun()
+    else:
+        st.caption("아직 실행된 작업이 없습니다.")
 
     st.markdown("### 최근 수집 작업")
     jobs = repo.list_recent_jobs(limit=8)
@@ -230,20 +319,32 @@ def render_raw_data_tab(repo: NasolRepository) -> None:
         horizontal=True,
         key="raw_transcript_filter",
     )
+    main_only = st.checkbox("본편만 보기 (나솔사계/지볶행 제외)", value=True, key="raw_main_only")
     transcript_only: bool | None = None
     if transcript_filter == "대본 있음":
         transcript_only = True
     elif transcript_filter == "대본 없음":
         transcript_only = False
+    auto_refresh_raw = st.checkbox(
+        "수집중 자동 새로고침 (3초)",
+        value=False,
+        key="raw_auto_refresh",
+    )
 
     videos = repo.get_videos(
         seasons=selected_seasons,
         transcript_only=transcript_only,
-        main_only=True,
+        main_only=main_only,
         limit=3000,
     )
     if not videos:
-        st.warning("조건에 맞는 데이터가 없습니다.")
+        if main_only:
+            st.warning(
+                "본편만 보기 조건에서 데이터가 없습니다. "
+                "`본편만 보기`를 잠시 해제해서 현재 저장된 데이터 상태를 확인해보세요."
+            )
+        else:
+            st.warning("조건에 맞는 데이터가 없습니다.")
         return
 
     total_count = len(videos)
@@ -356,6 +457,11 @@ def render_raw_data_tab(repo: NasolRepository) -> None:
                 for segment in segments
             ]
             st.dataframe(pd.DataFrame(segment_rows), use_container_width=True, height=260, hide_index=True)
+
+    running_jobs = repo.list_recent_jobs(limit=1, status="running")
+    if auto_refresh_raw and running_jobs:
+        time.sleep(3)
+        st.rerun()
 
 
 def render_analysis_items(items: list[dict[str, Any]], title: str, key_prefix: str) -> None:
